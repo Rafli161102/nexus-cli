@@ -167,7 +167,27 @@ ai config                               # Show config file location & effective 
 
 ---
 
-## Supported CLIs
+## Supported CLIs & Free vs Login Sync
+
+Nexus detects which CLIs work immediately for free and which ones have free tiers after signing in once:
+
+| CLI | Access / Free Tier | Sync Behavior |
+|---|---|---|
+| `opencode` | **Free cloud models** + local Ollama | Ready out of the box |
+| `ollama` | **100% Free & Local** (`llama3.2`, `qwen2.5`, etc.) | Ready once a model is pulled |
+| `mods`, `llm`, `crush`, `aider`, `hermes` | **Free locally via Ollama** (`ai setup`) | Auto-wired by `ai setup` |
+| `codex` | **Free locally via Ollama** (`--oss`) or ChatGPT/API | Local ready; `ai login codex` optional |
+| `gemini` | **Free individual tier** (Google account OAuth) | Sign in once via `ai login gemini` or `F2` |
+| `copilot` | **Copilot Free tier** (GitHub account OAuth) | Sign in once via `ai login copilot` or `F2` |
+| `dsh`, `agy` | Account / API key | Sign in once via `ai login <name>` or `F2` |
+
+Check live auth & sync state anytime with:
+
+```sh
+ai auth              # Show which CLIs are free-ready vs need login
+ai login gemini      # Sign in to Gemini CLI so Nexus syncs automatically
+ai login copilot     # Sign in to GitHub Copilot CLI
+```
 
 | Category | Tools |
 |---|---|

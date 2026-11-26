@@ -70,6 +70,8 @@ SLASH_COMMANDS = [
     ("/shell", "Toggle between AI Chat mode and Shell CLI mode"),
     ("/all ", "Query all ready AI agents in parallel"),
     ("/api ", "Call open-source GitHub APIs (e.g. /api weather, /api gh ai, /api sync)"),
+    ("/auth", "Show free AI tiers & login sync status"),
+    ("/login ", "Sign in to an AI CLI so it syncs with Nexus (e.g. /login gemini)"),
     ("/setup", "Auto-configure local Ollama & refresh all AI CLIs"),
     ("/native ", "Launch CLI full-screen interactive TUI inside this window"),
     ("/model ", "Set or inspect model for the active session"),
@@ -568,6 +570,7 @@ class NexusTerminal(App):
         self.session_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.sessions_dir = Path.home() / ".local" / "share" / "ai-hub" / "sessions"
         self.catalog = ai_hub.discover_all_clis(self.cfg, self.env)
+        self.auth_map = {r["name"]: r for r in ai_hub.get_auth_status(self.cfg, self.env)}
         self.tick_count = 0
         self.boot_progress = 0.0
         self.active_thinking: list[ThinkingWidget] = []
@@ -713,6 +716,15 @@ class NexusTerminal(App):
         t.append(" run any CLI", style="#94A3B8")
         self._boot_banner.update(t)
 
+    def _refresh_auth_and_dock(self) -> None:
+        self.catalog = ai_hub.discover_all_clis(self.cfg, self.env)
+        self.auth_map = {r["name"]: r for r in ai_hub.get_auth_status(self.cfg, self.env)}
+        try:
+            q = self.query_one("#cli-filter", Input).value
+        except Exception:
+            q = ""
+        self._populate_lists(q)
+
     def _populate_lists(self, query: str = "") -> None:
         q = query.strip().lower()
         mapping = [
@@ -726,10 +738,17 @@ class NexusTerminal(App):
             for it in items:
                 if q and q not in it["name"].lower() and q not in it["label"].lower():
                     continue
-                dot = "●" if it["installed"] else "○"
-                star = " ★" if it["name"] == self.active_agent and it["category"] == "ai" else ""
-                tag = " [TUI]" if it.get("interactive") and it["category"] != "ai" else ""
-                label = f"{dot} {it['name']}{star}{tag}"
+                if it["category"] == "ai":
+                    st = self.auth_map.get(it["name"], {})
+                    status = st.get("status", "ready" if it["installed"] else "missing")
+                    dot = "●" if status == "ready" else ("◐" if status == "login-needed" else "○")
+                    star = " ★" if it["name"] == self.active_agent else ""
+                    badge = " [login]" if status == "login-needed" else (" [free]" if st.get("tier") in ("free-cloud", "free-local") else "")
+                    label = f"{dot} {it['name']}{star}{badge}"
+                else:
+                    dot = "●" if it["installed"] else "○"
+                    tag = " [TUI]" if it.get("interactive") else ""
+                    label = f"{dot} {it['name']}{tag}"
                 ol.add_option(Option(label, id=f"{it['category']}:{it['name']}"))
 
         api_ol = self.query_one("#list-api", OptionList)
@@ -800,7 +819,11 @@ class NexusTerminal(App):
         inp = self.query_one("#prompt-input", Input)
         inp.placeholder = self._prompt_placeholder()
         inp.focus()
-        self.notify(f"Active agent: {name}")
+        st = self.auth_map.get(name, {})
+        if st.get("status") == "login-needed":
+            self.notify(f"{name}: sign in first with `/login {name}` or F2 ({st.get('detail', '')})", severity="warning")
+        else:
+            self.notify(f"Active agent: {name}")
 
     # ---------------------------------------------------------------- autocomplete
     def suggest_open(self) -> bool:
@@ -1138,7 +1161,8 @@ class NexusTerminal(App):
                 subprocess.run(cmd, cwd=self.cwd, env=self.env)
             except KeyboardInterrupt:
                 pass
-        self._append_info_card(f"Returned from native `{title}` session")
+        self._refresh_auth_and_dock()
+        self._append_info_card(f"Returned from native `{title}` session (auth/CLI status synced)")
 
     # ---------------------------------------------------------------- stream cards
     def _scroll_bottom(self) -> None:
@@ -1265,6 +1289,32 @@ class NexusTerminal(App):
                 return
             if cmd_head == "/setup":
                 self._handle_shell("NO_COLOR=1 ai setup")
+                return
+            if cmd_head == "/auth":
+                rows = ai_hub.get_auth_status(self.cfg, self.env)
+                self.auth_map = {r["name"]: r for r in rows}
+                lines = ["| CLI | Tier | Status | Details |", "|---|---|---|---|"]
+                for r in rows:
+                    badge = "● Ready" if r["status"] == "ready" else ("◐ Login needed" if r["status"] == "login-needed" else "○ Missing")
+                    act = f" (` /login {r['name']}`)" if r["status"] == "login-needed" and r["login_args"] is not None else ""
+                    lines.append(f"| `{r['name']}` | `{r['tier']}` | {badge} | {r['detail']}{act} |")
+                self._append_info_card("\n".join(lines), title="AI FREE TIERS & LOGIN SYNC")
+                return
+            if cmd_head == "/login":
+                target = rest or self.active_agent
+                if target not in self.cfg["agents"]:
+                    self.notify(f"Unknown agent: {target}", severity="error")
+                    return
+                r_info = self.auth_map.get(target, {})
+                l_args = r_info.get("login_args")
+                if l_args is None:
+                    self.notify(f"{target} uses local/free models and needs no login.")
+                    return
+                bp = ai_hub.find_bin(self.cfg["agents"][target])
+                if not bp:
+                    self.notify(f"Binary not found: {target}", severity="error")
+                    return
+                self._run_native_cmd([bp, *l_args], title=f"{target} login")
                 return
             if cmd_head == "/shell":
                 self._toggle_shell_mode()

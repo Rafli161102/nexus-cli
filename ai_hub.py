@@ -935,6 +935,109 @@ def cmd_update() -> int:
     print(green("✓ nexus-cli is up to date."))
     return 0
 
+def get_auth_status(cfg: dict, env: dict) -> list[dict]:
+    """Inspect free-tier availability and login sync status for all AI CLIs."""
+    home = Path.home()
+    ollama_models: list[str] = []
+    ol_bin = shutil.which("ollama", path=env.get("PATH"))
+    if ol_bin:
+        try:
+            r = subprocess.run([ol_bin, "list"], capture_output=True, text=True, timeout=5, env=env)
+            ollama_models = [ln.split()[0] for ln in (r.stdout or "").splitlines()[1:] if ln.strip()]
+        except Exception:
+            pass
+    has_ollama = bool(ollama_models)
+
+    gemini_synced = bool(
+        env.get("GEMINI_API_KEY")
+        or env.get("GOOGLE_APPLICATION_CREDENTIALS")
+        or (home / ".gemini" / "oauth_creds.json").exists()
+        or (home / ".gemini" / "google_accounts.json").exists()
+    )
+    cop_cfg = _load_json(home / ".copilot" / "config.json", {})
+    copilot_synced = bool(
+        env.get("COPILOT_GITHUB_TOKEN")
+        or env.get("GITHUB_TOKEN")
+        or (isinstance(cop_cfg, dict) and (cop_cfg.get("logged_in_users") or cop_cfg.get("last_logged_in_user")))
+    )
+    codex_cloud = bool(env.get("OPENAI_API_KEY") or (home / ".codex" / "auth.json").exists())
+    dsh_synced = bool(env.get("DEEPSEEK_API_KEY") or (home / ".dsh" / "credentials.json").exists())
+    agy_synced = bool(env.get("ANTHROPIC_API_KEY") or (home / ".claude" / ".credentials.json").exists())
+
+    specs = {
+        "opencode": ("free-cloud", True, None, "Free cloud models + Ollama fallback"),
+        "ollama": ("free-local", has_ollama, None, f"Local ({len(ollama_models)} models)" if has_ollama else "Run `ollama pull llama3.2`"),
+        "mods": ("free-local", has_ollama, None, "Wired to local Ollama (no login needed)"),
+        "llm": ("free-local", has_ollama, None, "Wired to local Ollama (no login needed)"),
+        "crush": ("free-local", has_ollama, None, "Wired to local Ollama (no login needed)"),
+        "aider": ("free-local", has_ollama, None, "Wired to local Ollama (no login needed)"),
+        "hermes": ("free-local", has_ollama, None, "Local Ollama launch provider"),
+        "codex": ("free-local", has_ollama or codex_cloud, ["login"], "Synced (ChatGPT/API)" if codex_cloud else "Free via Ollama (`codex login` optional)"),
+        "gemini": ("free-login", gemini_synced, [], "Google Free Tier (synced)" if gemini_synced else "Google Free Tier — sign in with Google"),
+        "copilot": ("free-login", copilot_synced, ["login"], "Copilot Free (synced)" if copilot_synced else "Copilot Free — sign in with GitHub"),
+        "dsh": ("account", dsh_synced, ["tui"], "Synced" if dsh_synced else "Requires DeepSeek account or DEEPSEEK_API_KEY"),
+        "agy": ("account", agy_synced, [], "Synced" if agy_synced else "Sign in via interactive `agy` session"),
+    }
+
+    rows = []
+    for name, a in cfg["agents"].items():
+        bp = find_bin(a)
+        tier, synced, login_args, detail = specs.get(name, ("account", False, [], a.get("note", "")))
+        if not bp:
+            status = "missing"
+        elif synced:
+            status = "ready"
+        else:
+            status = "login-needed"
+        rows.append({
+            "name": name,
+            "installed": bool(bp),
+            "tier": tier,
+            "synced": bool(bp and synced),
+            "status": status,
+            "detail": detail if bp else f"Not installed ({a.get('bin')})",
+            "login_args": login_args,
+        })
+    return rows
+
+def cmd_auth(cfg: dict, env: dict) -> int:
+    rows = get_auth_status(cfg, env)
+    print(bold("NEXUS AI AUTH & FREE TIERS\n"))
+    for title, pred in (
+        ("READY NOW (Free Cloud / Local Ollama)", lambda r: r["status"] == "ready"),
+        ("LOGIN TO SYNC (Free Tier / Account)", lambda r: r["status"] == "login-needed"),
+        ("NOT INSTALLED", lambda r: r["status"] == "missing"),
+    ):
+        grp = [r for r in rows if pred(r)]
+        if not grp:
+            continue
+        print(bold(title))
+        for r in grp:
+            mark = green("●") if r["status"] == "ready" else (yellow("◐") if r["status"] == "login-needed" else red("○"))
+            tag = dim(f"[{r['tier']}]")
+            hint = cyan(f"  → ai login {r['name']}") if r["status"] == "login-needed" and r["login_args"] is not None else ""
+            print(f"  {mark} {bold(r['name']):<12} {tag:<14} {r['detail']}{hint}")
+        print()
+    return 0
+
+def cmd_login(cfg: dict, name: str, cwd: str, env: dict) -> int:
+    a = cfg["agents"].get(name)
+    if not a:
+        die(f"unknown agent: {name}")
+    bp = find_bin(a)
+    if not bp:
+        die(f"{name} binary not found")
+    rows = {r["name"]: r for r in get_auth_status(cfg, env)}
+    login_args = rows.get(name, {}).get("login_args")
+    if login_args is None:
+        print(green(f"✓ {name} uses local Ollama / free models and needs no login."))
+        return 0
+    print(cyan(f"◈ Launching {name} login — once signed in, Nexus will use it automatically...\n"))
+    rc = subprocess.call([bp, *login_args], cwd=cwd, env=env)
+    if rc == 0:
+        print(green(f"\n✓ {name} session finished. Run `ai auth` to verify sync status."))
+    return rc
+
 # ---------------------------------------------------------------- ask
 def ask(cfg: dict, name: str, prompt: str, model: str, cont: bool,
         cwd: str, env: dict, timeout: int | None,
@@ -1327,6 +1430,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("models", help="list models for an agent"); sp.add_argument("agent", nargs="?", default=None)
     sp = sub.add_parser("use", help="set default agent"); sp.add_argument("agent")
     sp = sub.add_parser("doctor", help="check agent health"); sp.add_argument("agents", nargs="*")
+    sub.add_parser("auth", help="show free tiers and login sync status")
+    sub.add_parser("login", help="sign in to an AI CLI so it syncs with Nexus").add_argument("agent")
     sub.add_parser("setup", help="auto-configure local Ollama & refresh agent configs")
     sub.add_parser("update", help="update nexus-cli from GitHub")
     sp = sub.add_parser("config", help="show config"); sp.add_argument("--edit", action="store_true")
@@ -1343,7 +1448,7 @@ def main(argv: list[str]) -> int:
     cwd = cfg.get("cwd") or os.getcwd()
 
     parser = build_parser()
-    known = {"ask","all","chat","tui","agents","clis","api","models","use","doctor","setup","update","config","where","version","help","limits","status","fallback"}
+    known = {"ask","all","chat","tui","agents","clis","api","models","use","doctor","auth","login","setup","update","config","where","version","help","limits","status","fallback"}
 
     def norm_cwd(p):
         return str(Path(p or cwd).expanduser().resolve())
@@ -1386,6 +1491,10 @@ def main(argv: list[str]) -> int:
             return cmd_use(cfg, ns.agent)
         if ns.cmd == "doctor":
             return cmd_doctor(cfg, ns.agents, wcwd, base_env)
+        if ns.cmd == "auth":
+            return cmd_auth(cfg, base_env)
+        if ns.cmd == "login":
+            return cmd_login(cfg, ns.agent, wcwd, base_env)
         if ns.cmd == "setup":
             return cmd_setup(cfg, base_env)
         if ns.cmd == "update":
