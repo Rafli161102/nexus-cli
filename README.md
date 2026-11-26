@@ -9,7 +9,9 @@ Chat multi-turn like ChatGPT, Gemini, or Claude directly inside your terminal, s
 ## Features
 
 - **Unified AI CLI Hub**: Connects `opencode`, `gemini`, `codex`, `crush`, `copilot`, `dsh`, `aider`, `llm`, `mods`, `hermes`, `agy` / `claude`, and local `ollama` in a single interface.
-- **Multi-Turn Conversational Chat**: Maintains conversation context across turns (`opencode run -c`, `llm -c`, `crush -C`, `mods -C`, `gemini -r latest`, and full `messages[]` history for Ollama HTTP streaming).
+- **Multi-Turn Conversational Chat & Persistence**: Maintains conversation context across turns (`opencode run -c`, `llm -c`, `crush -C`, `mods -C`, `gemini -r latest`, and full `messages[]` history for Ollama HTTP streaming), auto-saves sessions (`/sessions`, `/load`), and exports to Markdown (`/export`).
+- **File Context Attachment (`@file`)**: Attach any local file directly into your prompt with `@file path/to/file` (with Tab autocomplete).
+- **One-Command Setup & Self-Update**: Run `ai setup` to auto-wire local Ollama into `crush`, `mods`, `llm`, and `aider`, and `ai update` to pull the latest release from GitHub.
 - **Real-Time Streaming & Animations**: Live token streaming with animated shimmer indicators, breathing status header, boot scanner, and instant cancellation (`Ctrl+X`).
 - **Auto-Switch Fallback**: Automatically rotates models and agents when hitting rate limits, quota errors, or timeouts (`ai limits`, `ai fallback`).
 - **Two Seamless Modes (`AI Chat` ↔ `Shell CLI`)**:
@@ -40,6 +42,7 @@ git clone https://github.com/Rafli161102/nexus-cli.git
 cd nexus-cli
 chmod +x install.sh
 ./install.sh
+ai setup   # Auto-wire local Ollama & sync agent configurations
 ```
 
 Ensure `~/.local/bin` is in your `$PATH` (add to `~/.zshrc` or `~/.bashrc`):
@@ -119,6 +122,8 @@ ai
 #### Slash Commands & Routing Inside TUI
 
 - **Direct chat**: Type normally to chat with the active AI agent (multi-turn context enabled).
+- **Attach file context**: `@file README.md summarize this file` (or type `@file ` + `Tab` to pick a file).
+- **Save, resume, & export**: `/sessions` to list saved chats, `/load 1` to restore, `/export notes.md` to export as Markdown, `/new` for a fresh session.
 - **Quick agent route**: `@gemini explain this error` or `@mods summarize README.md`
 - **Parallel comparison**: `@all compare Python vs Rust for CLI tools`
 - **Inline shell command**: `!git status`, `!rg TODO`, `!glow README.md`
@@ -152,6 +157,8 @@ ai clis                                 # List all discovered AI, Dev, and Scrip
 ai models opencode                      # List models for an agent
 ai use opencode                         # Set default agent
 ai doctor                               # Run binary & smoke diagnostics
+ai setup                                # Auto-wire local Ollama & refresh configs
+ai update                               # Pull latest updates from GitHub
 ai limits                               # View quota/cooldown status
 ai fallback                             # View or edit auto-switch fallback order
 ai api weather San Francisco            # Query API Hub from the command line

@@ -812,6 +812,129 @@ def cmd_config(cfg: dict, edit: bool) -> int:
         subprocess.run([ed, str(CONFIG_PATH)])
     return 0
 
+def cmd_setup(cfg: dict, env: dict) -> int:
+    """Auto-wire local Ollama & refresh config for all installed AI CLIs."""
+    home = Path.home()
+    print(bold("nexus setup — auto-configuring AI CLIs & local providers\n"))
+
+    # Detect local Ollama models
+    ollama_models: list[str] = []
+    ol_bin = shutil.which("ollama", path=env.get("PATH"))
+    if ol_bin:
+        try:
+            r = subprocess.run([ol_bin, "list"], capture_output=True, text=True, timeout=10, env=env)
+            for ln in (r.stdout or "").splitlines()[1:]:
+                if ln.strip():
+                    ollama_models.append(ln.split()[0])
+        except Exception:
+            pass
+    pref_model = "llama3.2:latest" if "llama3.2:latest" in ollama_models else (ollama_models[0] if ollama_models else "llama3.2:latest")
+    print(f"  Ollama : {green(', '.join(ollama_models)) if ollama_models else yellow('no local models found (`ollama pull llama3.2`)')}")
+
+    # 1. Crush (~/.config/crush/crush.json)
+    if find_bin(cfg["agents"]["crush"]):
+        crush_dir = home / ".config" / "crush"
+        crush_dir.mkdir(parents=True, exist_ok=True)
+        crush_models = ollama_models or [pref_model]
+        crush_cfg = {
+            "$schema": "https://charm.land/crush.json",
+            "providers": {
+                "ollama": {
+                    "name": "Ollama Local",
+                    "type": "openai-compat",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "models": [
+                        {"id": m, "name": m, "context_window": 32768, "default_max_tokens": 4096}
+                        for m in crush_models
+                    ],
+                }
+            },
+            "models": {
+                "large": {"model": pref_model, "provider": "ollama"},
+                "small": {"model": pref_model, "provider": "ollama"},
+            },
+        }
+        (crush_dir / "crush.json").write_text(json.dumps(crush_cfg, indent=2) + "\n")
+        print(f"  crush  : {green('configured')} -> {crush_dir / 'crush.json'} ({pref_model})")
+
+    # 2. llm (extra-openai-models.yaml + key + default)
+    if find_bin(cfg["agents"]["llm"]):
+        llm_dir = home / ("Library/Application Support/io.datasette.llm" if sys.platform == "darwin" else ".config/io.datasette.llm")
+        llm_dir.mkdir(parents=True, exist_ok=True)
+        lines = []
+        for m in (ollama_models or [pref_model]):
+            slug = "ollama-" + m.split(":")[0]
+            lines.append(f'- model_id: {slug}\n  model_name: {m}\n  api_base: "http://127.0.0.1:11434/v1"\n  api_key_name: ollama')
+        (llm_dir / "extra-openai-models.yaml").write_text("\n".join(lines) + "\n")
+        kf = llm_dir / "keys.json"
+        keys = _load_json(kf, {})
+        keys.setdefault("ollama", "ollama")
+        kf.write_text(json.dumps(keys, indent=2) + "\n")
+        def_slug = "ollama-" + pref_model.split(":")[0]
+        (llm_dir / "default_model.txt").write_text(def_slug + "\n")
+        print(f"  llm    : {green('configured')} -> default={def_slug}")
+
+    # 3. mods (mods.yml)
+    if find_bin(cfg["agents"]["mods"]):
+        mods_dir = home / ("Library/Application Support/mods" if sys.platform == "darwin" else ".config/mods")
+        mods_yml = mods_dir / "mods.yml"
+        if mods_yml.exists():
+            txt = mods_yml.read_text()
+            txt = re.sub(r"^default-api:.*$", "default-api: local", txt, count=1, flags=re.M)
+            txt = re.sub(r"^default-model:.*$", f"default-model: {pref_model}", txt, count=1, flags=re.M)
+            if "  local:" not in txt and "apis:\n" in txt:
+                txt = txt.replace("apis:\n", (
+                    "apis:\n"
+                    "  local:\n"
+                    "    base-url: http://127.0.0.1:11434/v1\n"
+                    "    api-key: ollama\n"
+                    "    models:\n"
+                    f"      \"{pref_model}\":\n"
+                    "        max-input-chars: 128000\n"
+                ), 1)
+            mods_yml.write_text(txt)
+            print(f"  mods   : {green('configured')} -> {mods_yml} ({pref_model})")
+
+    # 4. aider (~/.aider.conf.yml)
+    if find_bin(cfg["agents"]["aider"]):
+        aider_conf = home / ".aider.conf.yml"
+        if not aider_conf.exists():
+            aider_conf.write_text(f"model: ollama_chat/{pref_model}\nauto-commits: false\nmap-tokens: 0\n")
+        print(f"  aider  : {green('configured')} -> {aider_conf}")
+
+    # 5. Refresh ai-hub config.json with latest defaults while keeping user env/cwd
+    fresh = {
+        "default_agent": cfg.get("default_agent", "opencode"),
+        "cwd": cfg.get("cwd"),
+        "env": cfg.get("env", {}),
+        "auto_switch_agent": cfg.get("auto_switch_agent", True),
+        "fallback_agents": ["opencode", "mods", "ollama", "llm", "hermes", "aider", "crush", "codex"],
+        "max_fallback_attempts": cfg.get("max_fallback_attempts", 8),
+        "max_model_fallbacks": cfg.get("max_model_fallbacks", 3),
+        "agents": default_agents(),
+    }
+    save_config(fresh)
+    print(f"  ai-hub : {green('synced')} -> {CONFIG_PATH}")
+    print(dim("\nCloud CLIs (optional): run `F2` in Nexus on gemini / codex / copilot / agy to sign in."))
+    return 0
+
+def cmd_update() -> int:
+    """Update nexus-cli from its git remote."""
+    if not (ROOT_DIR / ".git").exists():
+        die(f"{ROOT_DIR} is not a git repository.")
+    print(bold("Updating nexus-cli from GitHub..."))
+    r = subprocess.run(["git", "-C", str(ROOT_DIR), "pull", "--ff-only"], text=True)
+    if r.returncode != 0:
+        return r.returncode
+    inst = ROOT_DIR / "install.sh"
+    if inst.exists() and VENV_PYTHON.exists():
+        uv_bin = shutil.which("uv")
+        req = ROOT_DIR / "requirements.txt"
+        if uv_bin and req.exists():
+            subprocess.run([uv_bin, "pip", "install", "--python", str(VENV_PYTHON), "-r", str(req)])
+    print(green("✓ nexus-cli is up to date."))
+    return 0
+
 # ---------------------------------------------------------------- ask
 def ask(cfg: dict, name: str, prompt: str, model: str, cont: bool,
         cwd: str, env: dict, timeout: int | None,
@@ -1204,6 +1327,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("models", help="list models for an agent"); sp.add_argument("agent", nargs="?", default=None)
     sp = sub.add_parser("use", help="set default agent"); sp.add_argument("agent")
     sp = sub.add_parser("doctor", help="check agent health"); sp.add_argument("agents", nargs="*")
+    sub.add_parser("setup", help="auto-configure local Ollama & refresh agent configs")
+    sub.add_parser("update", help="update nexus-cli from GitHub")
     sp = sub.add_parser("config", help="show config"); sp.add_argument("--edit", action="store_true")
     sub.add_parser("limits", help="agent quota/cooldown status")
     sub.add_parser("status", help="agent quota/cooldown status")
@@ -1218,7 +1343,7 @@ def main(argv: list[str]) -> int:
     cwd = cfg.get("cwd") or os.getcwd()
 
     parser = build_parser()
-    known = {"ask","all","chat","tui","agents","clis","api","models","use","doctor","config","where","version","help","limits","status","fallback"}
+    known = {"ask","all","chat","tui","agents","clis","api","models","use","doctor","setup","update","config","where","version","help","limits","status","fallback"}
 
     def norm_cwd(p):
         return str(Path(p or cwd).expanduser().resolve())
@@ -1261,6 +1386,10 @@ def main(argv: list[str]) -> int:
             return cmd_use(cfg, ns.agent)
         if ns.cmd == "doctor":
             return cmd_doctor(cfg, ns.agents, wcwd, base_env)
+        if ns.cmd == "setup":
+            return cmd_setup(cfg, base_env)
+        if ns.cmd == "update":
+            return cmd_update()
         if ns.cmd == "config":
             return cmd_config(cfg, ns.edit)
         if ns.cmd == "tui":

@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -62,9 +64,13 @@ SLASH_COMMANDS = [
     ("/agent ", "Switch active AI agent (e.g. /agent gemini)"),
     ("/open ", "Open CLI in a new terminal window (e.g. /open gemini)"),
     ("/new", "Start a new conversation (clear chat history)"),
+    ("/export ", "Export conversation to Markdown (e.g. /export chat.md)"),
+    ("/sessions", "List saved chat sessions"),
+    ("/load ", "Restore a saved session by number (e.g. /load 1)"),
     ("/shell", "Toggle between AI Chat mode and Shell CLI mode"),
     ("/all ", "Query all ready AI agents in parallel"),
     ("/api ", "Call open-source GitHub APIs (e.g. /api weather, /api gh ai, /api sync)"),
+    ("/setup", "Auto-configure local Ollama & refresh all AI CLIs"),
     ("/native ", "Launch CLI full-screen interactive TUI inside this window"),
     ("/model ", "Set or inspect model for the active session"),
     ("/cwd ", "Change or show current working directory (or cd <dir>)"),
@@ -559,6 +565,8 @@ class NexusTerminal(App):
         self.cont = False
         self.shell_mode = False
         self.chat_history: list[dict] = []
+        self.session_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.sessions_dir = Path.home() / ".local" / "share" / "ai-hub" / "sessions"
         self.catalog = ai_hub.discover_all_clis(self.cfg, self.env)
         self.tick_count = 0
         self.boot_progress = 0.0
@@ -835,9 +843,21 @@ class NexusTerminal(App):
         val = event.value
         box = self.query_one("#suggest-box", OptionList)
         items: list[tuple[str, str]] = []
-        if val.startswith("@") and " " not in val:
+        if val.startswith("@file "):
+            q = val[6:].strip().lower()
+            try:
+                skip = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+                entries = sorted(Path(self.cwd).iterdir(), key=lambda p: (p.is_dir(), p.name.lower()))
+                for p in entries:
+                    if p.name in skip or p.name.startswith("."):
+                        continue
+                    if p.is_file() and (not q or q in p.name.lower()):
+                        items.append((f"@file {p.name} ", f"@file {p.name:<20} — attach file ({p.stat().st_size} B)"))
+            except OSError:
+                pass
+        elif val.startswith("@") and " " not in val:
             q = val[1:].lower()
-            cands = [("all", "Query all ready AI agents in parallel")] + [
+            cands = [("all", "Query all ready AI agents in parallel"), ("file", "Attach a local file as prompt context")] + [
                 (x["name"], x["label"]) for x in self.catalog["ai"] if x["installed"]
             ]
             for name, desc in cands:
@@ -961,8 +981,82 @@ class NexusTerminal(App):
     def action_new_chat(self) -> None:
         self.chat_history.clear()
         self.cont = False
+        self.session_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.action_clear_stream()
         self.notify(f"Started a new chat session ({self.active_agent})")
+
+    def _save_session(self) -> None:
+        if not self.chat_history:
+            return
+        try:
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            path = self.sessions_dir / f"session-{self.session_id}.json"
+            payload = {
+                "id": self.session_id,
+                "agent": self.active_agent,
+                "cwd": self.cwd,
+                "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "messages": self.chat_history,
+            }
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        except OSError:
+            pass
+
+    def _list_sessions(self) -> list[Path]:
+        try:
+            if not self.sessions_dir.is_dir():
+                return []
+            return sorted(self.sessions_dir.glob("session-*.json"), reverse=True)[:15]
+        except OSError:
+            return []
+
+    def _export_markdown(self, target_name: str) -> None:
+        if not self.chat_history:
+            self.notify("No chat messages to export yet", severity="warning")
+            return
+        fname = target_name or f"nexus-chat-{self.session_id}.md"
+        out_path = Path(fname).expanduser()
+        if not out_path.is_absolute():
+            out_path = Path(self.cwd) / out_path
+        lines = [f"# Nexus Terminal Chat ({self.session_id})\n", f"- **Agent:** `{self.active_agent}`\n", f"- **CWD:** `{self.cwd}`\n\n---\n"]
+        for m in self.chat_history:
+            role = "You" if m["role"] == "user" else self.active_agent
+            lines.append(f"### {role}\n\n{m['content']}\n\n")
+        try:
+            out_path.write_text("\n".join(lines))
+            self._append_info_card(f"Exported conversation to `{out_path}`", title="EXPORTED")
+        except OSError as e:
+            self.notify(f"Export failed: {e}", severity="error")
+
+    def _expand_file_mentions(self, text: str) -> tuple[str, list[str]]:
+        """Resolve `@file path` tokens into fenced file contents."""
+        attached: list[str] = []
+        pattern = re.compile(r"@file\s+(\S+)")
+        blocks: list[str] = []
+
+        def _repl(m: re.Match) -> str:
+            raw_path = m.group(1)
+            p = Path(raw_path).expanduser()
+            if not p.is_absolute():
+                p = Path(self.cwd) / p
+            if p.is_file():
+                try:
+                    content = p.read_text(errors="replace")[:24000]
+                    attached.append(p.name)
+                    blocks.append(f"File `{p.name}`:\n```\n{content}\n```")
+                    return f"[attached: {p.name}]"
+                except OSError:
+                    pass
+            return m.group(0)
+
+        cleaned = pattern.sub(_repl, text).strip()
+        if not blocks:
+            return text, attached
+        if not cleaned or cleaned.startswith("[attached:"):
+            cleaned = f"Explain and review the attached file(s):\n\n" + "\n\n".join(blocks)
+        else:
+            cleaned = f"{cleaned}\n\n" + "\n\n".join(blocks)
+        return cleaned, attached
 
     def _toggle_shell_mode(self) -> None:
         self.shell_mode = not self.shell_mode
@@ -1127,6 +1221,51 @@ class NexusTerminal(App):
             if cmd_head == "/new":
                 self.action_new_chat()
                 return
+            if cmd_head == "/export":
+                self._export_markdown(rest)
+                return
+            if cmd_head == "/sessions":
+                files = self._list_sessions()
+                if not files:
+                    self._append_info_card("No saved sessions yet.", title="SESSIONS")
+                else:
+                    lines = []
+                    for idx, f in enumerate(files, 1):
+                        try:
+                            d = json.loads(f.read_text())
+                            n_msg = len(d.get("messages", [])) // 2
+                            preview = (d.get("messages", [{}])[0].get("content", "")[:50]).replace("\n", " ")
+                            lines.append(f"{idx}. `{d.get('id')}` · `{d.get('agent')}` · {n_msg} turns — _{preview}_")
+                        except Exception:
+                            lines.append(f"{idx}. `{f.name}`")
+                    lines.append("\nUse `/load <number>` to restore a session.")
+                    self._append_info_card("\n".join(lines), title="SAVED SESSIONS")
+                return
+            if cmd_head == "/load":
+                files = self._list_sessions()
+                if not rest.isdigit() or not (1 <= int(rest) <= len(files)):
+                    self.notify("Usage: /load <session_number> (see /sessions)", severity="warning")
+                    return
+                try:
+                    d = json.loads(files[int(rest) - 1].read_text())
+                    self.chat_history = list(d.get("messages", []))
+                    self.session_id = d.get("id", self.session_id)
+                    if d.get("agent") in self.cfg["agents"]:
+                        self._set_active_agent(d["agent"])
+                    self.cont = bool(self.chat_history)
+                    self.action_clear_stream()
+                    for m in self.chat_history:
+                        if m["role"] == "user":
+                            self._append_user_card(self.active_agent, m["content"])
+                        else:
+                            self._append_ai_card({"agent": self.active_agent, "ok": True, "output": m["content"], "seconds": 0})
+                    self.notify(f"Loaded session {self.session_id}")
+                except Exception as e:
+                    self.notify(f"Failed to load session: {e}", severity="error")
+                return
+            if cmd_head == "/setup":
+                self._handle_shell("NO_COLOR=1 ai setup")
+                return
             if cmd_head == "/shell":
                 self._toggle_shell_mode()
                 return
@@ -1203,6 +1342,11 @@ class NexusTerminal(App):
             return
 
         if line.startswith("@"):
+            if line.startswith("@file "):
+                expanded, attached = self._expand_file_mentions(line)
+                self._append_user_card(self.active_agent, line)
+                self._run_ai(self.active_agent, expanded)
+                return
             parts = line[1:].split(None, 1)
             target = parts[0].lower()
             prompt = parts[1].strip() if len(parts) > 1 else ""
@@ -1217,8 +1361,9 @@ class NexusTerminal(App):
                 if not prompt:
                     self._set_active_agent(target)
                     return
+                expanded, _ = self._expand_file_mentions(prompt)
                 self._append_user_card(target, prompt)
-                self._run_ai(target, prompt)
+                self._run_ai(target, expanded)
                 return
 
         bare_interactive = {"gemini", "claude", "agy", "opencode", "codex", "crush", "hermes", "aider", "lazygit", "dsh", "zsh"}
@@ -1235,8 +1380,9 @@ class NexusTerminal(App):
             self._handle_shell(line)
             return
 
+        expanded, _ = self._expand_file_mentions(line)
         self._append_user_card(self.active_agent, line)
-        self._run_ai(self.active_agent, line)
+        self._run_ai(self.active_agent, expanded)
 
     def _change_cwd(self, target: str) -> None:
         p = Path(target).expanduser()
@@ -1354,6 +1500,7 @@ class NexusTerminal(App):
             self.cont = True
             self.chat_history.append({"role": "user", "content": prompt})
             self.chat_history.append({"role": "assistant", "content": res.get("output", "")})
+            self._save_session()
         self._append_ai_card(res)
 
     @work
