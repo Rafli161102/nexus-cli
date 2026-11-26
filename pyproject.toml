@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexus-cli"
+version = "2.0.0"
+description = "Unified animated Terminal UI and CLI hub for all AI agents, open-source developer CLIs, and public GitHub APIs."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Rafli161102" }]
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=8.0.0",
+    "rich>=14.0.0",
+    "prompt-toolkit>=3.0.0",
+    "httpx>=0.28.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Rafli161102/nexus-cli"
+Repository = "https://github.com/Rafli161102/nexus-cli"
+
+[project.scripts]
+ai = "ai_hub:cli_main"
+nexus = "nexus_tui:main"
+
+[tool.setuptools]
+py-modules = ["ai_hub", "api_hub", "nexus_tui"]
